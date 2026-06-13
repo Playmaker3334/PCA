@@ -160,13 +160,21 @@ def load_npz(path):
     return np.load(path, allow_pickle=True)
 
 
+class _MlflowStub:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def __getattr__(self, _name):
+        def _noop(*args, **kwargs):
+            return None
+        return _noop
+
+
 def setup_mlflow(run_name=None):
-    import mlflow
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment(MLFLOW_EXPERIMENT)
-    if run_name:
-        return mlflow.start_run(run_name=run_name)
-    return mlflow
+    return _MlflowStub()
 
 
 def gpu_info():

@@ -63,9 +63,8 @@ def extract_for_corpus(extractor, prompts, layers, max_length=256):
 
 
 def main():
-    import mlflow
     set_seed()
-    with setup_mlflow("01_extract_activations"):
+    with setup_mlflow("01_extract_activations") as mlflow:
         mlflow.log_dict(gpu_info(), "gpu_info.json")
         mlflow.log_param("layers", CANDIDATE_LAYERS)
         try:

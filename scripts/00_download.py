@@ -85,8 +85,7 @@ def download_datasets():
 
 
 def main():
-    import mlflow
-    with setup_mlflow("00_download"):
+    with setup_mlflow("00_download") as mlflow:
         mlflow.log_dict(gpu_info(), "gpu_info.json")
         try:
             download_model_weights()

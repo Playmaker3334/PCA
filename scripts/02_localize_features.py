@@ -8,9 +8,9 @@ import numpy as np
 from src.localization import (
     attribution_score,
     contrastive_difference,
-    intersect_rankings,
     linear_probe,
     neuronpedia_keyword_search,
+    rank_fusion,
     save_localization_report,
 )
 from src.sae import JumpReLUSAE, topk_binarize
@@ -20,11 +20,13 @@ from src.utils import (
     CANDIDATE_LAYERS,
     METRICS,
     SAE_FEATURES,
+    SEED,
     TOP_K_FEATURES,
     Timer,
     get_logger,
-    log_exception,
+    load_json,
     load_npz,
+    log_exception,
     save_json,
     save_npz,
     set_seed,
@@ -35,11 +37,49 @@ logger = get_logger("localize")
 
 SAFE = [c for c in SAFE_CORPORA if c != "xstest"]
 UNSAFE = list(UNSAFE_CORPORA)
+UNSAFE_SELECT_FRAC = 0.5
+
+
+def get_or_create_unsafe_split(n_unsafe, select_frac=UNSAFE_SELECT_FRAC, seed=SEED):
+    path = METRICS / "unsafe_split.json"
+    if path.exists():
+        rec = load_json(path)
+        if rec.get("n_unsafe") == n_unsafe:
+            return (np.array(rec["select_idx"], dtype=np.int64),
+                    np.array(rec["eval_idx"], dtype=np.int64))
+        logger.warning("unsafe split count mismatch; recreating")
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_unsafe)
+    n_sel = int(select_frac * n_unsafe)
+    select_idx, eval_idx = perm[:n_sel], perm[n_sel:]
+    save_json({
+        "n_unsafe": int(n_unsafe),
+        "select_frac": float(select_frac),
+        "seed": int(seed),
+        "select_idx": select_idx.tolist(),
+        "eval_idx": eval_idx.tolist(),
+    }, path)
+    logger.info(f"created unsafe split: n={n_unsafe} "
+                f"select={len(select_idx)} eval={len(eval_idx)}")
+    return select_idx, eval_idx
+
+
+def build_feature_descriptions(np_results):
+    desc = {}
+    refusal = set()
+    for _kw, feats in (np_results or {}).items():
+        for f in feats:
+            idx = int(f["index"])
+            d = f.get("description", "")
+            if d and idx not in desc:
+                desc[idx] = d
+            refusal.add(idx)
+    return desc, sorted(refusal)
 
 
 def load_activations_for_layer(layer):
     safe_acts, unsafe_acts = [], []
-    safe_prompts, unsafe_prompts = [], []
+    safe_prompts, unsafe_prompts, unsafe_corpus = [], [], []
     for name in SAFE + UNSAFE:
         path = ACTIVATIONS / f"{name}.npz"
         if not path.exists():
@@ -58,11 +98,12 @@ def load_activations_for_layer(layer):
             else:
                 unsafe_acts.append(acts)
                 unsafe_prompts.extend(list(prompts))
+                unsafe_corpus.extend([name] * len(prompts))
         except Exception:
             log_exception(logger, f"failed loading {name}")
     safe = np.vstack(safe_acts) if safe_acts else np.zeros((0, 1))
     unsafe = np.vstack(unsafe_acts) if unsafe_acts else np.zeros((0, 1))
-    return safe, unsafe, safe_prompts, unsafe_prompts
+    return safe, unsafe, safe_prompts, unsafe_prompts, unsafe_corpus
 
 
 def encode_batched(sae, activations, batch_size=64):
@@ -70,7 +111,7 @@ def encode_batched(sae, activations, batch_size=64):
         return np.zeros((0, sae.n_features), dtype=np.uint8), np.zeros((0, sae.n_features))
     z_bin_all, z_dense_all = [], []
     for i in range(0, len(activations), batch_size):
-        batch = activations[i:i+batch_size]
+        batch = activations[i:i + batch_size]
         z = sae.encode_np(batch)
         z_dense_all.append(z)
         z_bin_all.append(topk_binarize(z, TOP_K_FEATURES))
@@ -80,7 +121,7 @@ def encode_batched(sae, activations, batch_size=64):
 def localize_layer(layer):
     import torch
     logger.info(f"=== localizing layer {layer} ===")
-    safe_acts, unsafe_acts, safe_p, unsafe_p = load_activations_for_layer(layer)
+    safe_acts, unsafe_acts, safe_p, unsafe_p, unsafe_c = load_activations_for_layer(layer)
     if len(safe_acts) == 0 or len(unsafe_acts) == 0:
         logger.warning(f"insufficient data for layer {layer}")
         return None
@@ -100,23 +141,30 @@ def localize_layer(layer):
              prompts=np.array(safe_p, dtype=object))
     save_npz(SAE_FEATURES / f"layer_{layer}_unsafe.npz",
              z_binary=z_unsafe_bin, z_dense=z_unsafe_dense,
-             prompts=np.array(unsafe_p, dtype=object))
+             prompts=np.array(unsafe_p, dtype=object),
+             corpus=np.array(unsafe_c, dtype=object))
+
+    select_idx, _eval_idx = get_or_create_unsafe_split(len(z_unsafe_bin))
+    z_unsafe_sel = z_unsafe_bin[select_idx].astype(np.float32)
+    z_safe_f = z_safe_bin.astype(np.float32)
+    logger.info(f"localization on U_select: safe={z_safe_f.shape} "
+                f"unsafe_select={z_unsafe_sel.shape}")
 
     logger.info("running linear probe")
-    probe = linear_probe(z_unsafe_bin.astype(np.float32), z_safe_bin.astype(np.float32))
+    probe = linear_probe(z_unsafe_sel, z_safe_f)
     logger.info(f"probe AUROC={probe['auroc']:.4f} nonzero={probe['nonzero_coefs']}")
 
     logger.info("running contrastive difference")
-    diff = contrastive_difference(z_unsafe_bin.astype(np.float32), z_safe_bin.astype(np.float32))
+    diff = contrastive_difference(z_unsafe_sel, z_safe_f)
 
     logger.info("running attribution")
-    labels = np.concatenate([np.ones(len(z_unsafe_bin)), np.zeros(len(z_safe_bin))])
-    X_all = np.vstack([z_unsafe_bin, z_safe_bin]).astype(np.float32)
+    labels = np.concatenate([np.ones(len(z_unsafe_sel)), np.zeros(len(z_safe_f))])
+    X_all = np.vstack([z_unsafe_sel, z_safe_f]).astype(np.float32)
     attribution = attribution_score(X_all, labels)
     top_attribution = [(int(i), float(attribution[i]))
                        for i in np.argsort(-np.abs(attribution))[:50]]
 
-    intersect = intersect_rankings([
+    intersect = rank_fusion([
         probe["top_features"][:50],
         diff["top_features"][:50],
         top_attribution[:50],
@@ -136,13 +184,12 @@ def localize_layer(layer):
         "attribution_top": top_attribution,
         "intersected_top_features": intersect,
         "neuronpedia": np_results,
-        "n_safe": int(len(z_safe_bin)),
-        "n_unsafe": int(len(z_unsafe_bin)),
+        "n_safe": int(len(z_safe_f)),
+        "n_unsafe_select": int(len(z_unsafe_sel)),
     }
     save_localization_report(report, layer)
     del sae
     if device == "cuda":
-        import torch
         torch.cuda.empty_cache()
     return report
 
@@ -169,22 +216,38 @@ def main():
         best_layer = max(reports.keys(), key=lambda L: reports[L]["probe_auroc"])
         best = reports[best_layer]
         selected = best["intersected_top_features"]
+
+        desc_map, refusal_all = build_feature_descriptions(best.get("neuronpedia", {}))
+        sel_set = set(int(i) for i in selected)
+        feature_descriptions = {int(k): v for k, v in desc_map.items() if int(k) in sel_set}
+        refusal_sae_indices = [int(i) for i in refusal_all if int(i) in sel_set]
+
         decision = {
             "best_layer": int(best_layer),
             "best_auroc": float(best["probe_auroc"]),
             "selected_feature_indices": list(map(int, selected)),
-            "summary_per_layer": {L: {"auroc": float(reports[L]["probe_auroc"]),
-                                       "nonzero": int(reports[L]["probe_nonzero"]),
-                                       "n_safe": int(reports[L]["n_safe"]),
-                                       "n_unsafe": int(reports[L]["n_unsafe"])}
-                                  for L in reports},
+            "feature_descriptions": feature_descriptions,
+            "refusal_sae_indices": refusal_sae_indices,
+            "reconstruction_error": {
+                "safe": float(best["reconstruction_error_safe"]),
+                "unsafe": float(best["reconstruction_error_unsafe"]),
+            },
+            "summary_per_layer": {
+                L: {"auroc": float(reports[L]["probe_auroc"]),
+                    "nonzero": int(reports[L]["probe_nonzero"]),
+                    "n_safe": int(reports[L]["n_safe"]),
+                    "n_unsafe_select": int(reports[L]["n_unsafe_select"])}
+                for L in reports
+            },
         }
         save_json(decision, METRICS / "localization_decision.json")
         mlflow.log_param("best_layer", best_layer)
         mlflow.log_metric("best_auroc", best["probe_auroc"])
+        mlflow.log_metric("n_refusal_features_selected", len(refusal_sae_indices))
         mlflow.log_artifact(str(METRICS / "localization_decision.json"))
         logger.info(f"selected layer {best_layer} AUROC={best['probe_auroc']:.4f} "
-                    f"with {len(selected)} features")
+                    f"with {len(selected)} features, "
+                    f"{len(refusal_sae_indices)} refusal-tagged")
 
 
 if __name__ == "__main__":

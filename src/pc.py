@@ -145,7 +145,8 @@ class HCLT(nn.Module):
         return self._log_prob_impl(X, observed_mask=observed_mask)
 
     def fit(self, X, num_epochs=PC_NUM_EPOCHS, batch_size=PC_BATCH_SIZE,
-            lr=PC_LR, val_X=None, log_every=1, mlflow_log=False):
+            lr=PC_LR, val_X=None, log_every=1, mlflow_log=False,
+            patience=5, min_delta=1e-3):
         if isinstance(X, np.ndarray):
             X_t = torch.tensor(X, dtype=torch.float32)
         else:
@@ -154,6 +155,9 @@ class HCLT(nn.Module):
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
         optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         history = []
+        best_val = float("inf")
+        best_state = None
+        epochs_no_improve = 0
         for epoch in range(num_epochs):
             self.train()
             losses = []
@@ -170,6 +174,7 @@ class HCLT(nn.Module):
                 pbar.set_postfix(loss=f"{losses[-1]:.3f}")
             mean_train = float(np.mean(losses))
             entry = {"epoch": epoch + 1, "train_nll": mean_train}
+            val_nll = None
             if val_X is not None:
                 self.eval()
                 with torch.no_grad():
@@ -177,7 +182,8 @@ class HCLT(nn.Module):
                              if isinstance(val_X, np.ndarray) else val_X.float())
                     val_t = val_t.to(self.device)
                     val_lp = self._log_prob_impl(val_t)
-                    entry["val_nll"] = float(-val_lp.mean())
+                    val_nll = float(-val_lp.mean())
+                    entry["val_nll"] = val_nll
             if (epoch + 1) % log_every == 0:
                 logger.info(f"epoch {epoch+1}: " + " ".join(
                     [f"{k}={v:.4f}" for k, v in entry.items() if k != "epoch"]
@@ -186,11 +192,26 @@ class HCLT(nn.Module):
                 try:
                     import mlflow
                     mlflow.log_metric("train_nll", mean_train, step=epoch + 1)
-                    if "val_nll" in entry:
-                        mlflow.log_metric("val_nll", entry["val_nll"], step=epoch + 1)
+                    if val_nll is not None:
+                        mlflow.log_metric("val_nll", val_nll, step=epoch + 1)
                 except Exception:
                     pass
             history.append(entry)
+            if val_nll is not None:
+                if val_nll < best_val - min_delta:
+                    best_val = val_nll
+                    best_state = {k: v.detach().cpu().clone()
+                                  for k, v in self.state_dict().items()}
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if epochs_no_improve >= patience:
+                        logger.info(f"early stop at epoch {epoch+1} "
+                                    f"(best val_nll={best_val:.4f})")
+                        break
+        if best_state is not None:
+            self.load_state_dict(best_state)
+            logger.info(f"restored best model (val_nll={best_val:.4f})")
         return history
 
     @torch.no_grad()
@@ -287,7 +308,7 @@ class HCLT(nn.Module):
     @classmethod
     def load(cls, path, device="cuda"):
         path = Path(path)
-        d = torch.load(path / "hclt.pt", map_location=device)
+        d = torch.load(path / "hclt.pt", map_location=device, weights_only=False)
         pc = cls(
             num_vars=d["num_vars"],
             num_states=d["K"],

@@ -15,10 +15,11 @@ from src.utils import (
     ACTIVATIONS,
     METRICS,
     RAW,
+    SEED,
     get_logger,
-    log_exception,
     load_json,
     load_npz,
+    log_exception,
     save_json,
     set_seed,
     setup_mlflow,
@@ -26,18 +27,19 @@ from src.utils import (
 
 logger = get_logger("baselines")
 
+SAFE_FILES = [c for c in SAFE_CORPORA if c != "xstest"]
+UNSAFE_FILES = list(UNSAFE_CORPORA)
+
 
 def load_layer_acts(layer):
-    safe_files = [c for c in SAFE_CORPORA if c != "xstest"]
-    unsafe_files = list(UNSAFE_CORPORA)
     safe_acts, unsafe_acts = [], []
-    for n in safe_files:
+    for n in SAFE_FILES:
         p = ACTIVATIONS / f"{n}.npz"
         if p.exists():
             d = load_npz(p)
             if f"layer_{layer}" in d.files:
                 safe_acts.append(d[f"layer_{layer}"])
-    for n in unsafe_files:
+    for n in UNSAFE_FILES:
         p = ACTIVATIONS / f"{n}.npz"
         if p.exists():
             d = load_npz(p)
@@ -45,10 +47,14 @@ def load_layer_acts(layer):
                 unsafe_acts.append(d[f"layer_{layer}"])
     safe = np.vstack(safe_acts) if safe_acts else np.zeros((0, 1))
     unsafe = np.vstack(unsafe_acts) if unsafe_acts else np.zeros((0, 1))
-    rng = np.random.default_rng(42)
-    safe = safe[rng.permutation(len(safe))]
-    unsafe = unsafe[rng.permutation(len(unsafe))]
     return safe, unsafe
+
+
+def split_safe(n_safe, val_frac=0.1, seed=SEED):
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(n_safe)
+    n_val = int(val_frac * n_safe)
+    return idx[n_val:], idx[:n_val]
 
 
 def evaluate_direction(direction, X_safe, X_unsafe):
@@ -120,13 +126,23 @@ def main():
         logger.info(f"safe={safe_acts.shape} unsafe={unsafe_acts.shape}")
 
         try:
-            n_train = min(len(safe_acts), len(unsafe_acts)) // 2
+            unsafe_split = load_json(METRICS / "unsafe_split.json")
+            select_idx = np.array(unsafe_split["select_idx"], dtype=np.int64)
+            eval_idx = np.array(unsafe_split["eval_idx"], dtype=np.int64)
+            if unsafe_split["n_unsafe"] != len(unsafe_acts):
+                raise RuntimeError("unsafe_split out of sync with activations")
+
+            safe_train_idx, safe_val_idx = split_safe(len(safe_acts), seed=SEED)
+
             direction = baseline_refusal_direction(
-                unsafe_acts[:n_train], safe_acts[:n_train]
+                unsafe_acts[select_idx], safe_acts[safe_train_idx]
             )
-            ev = evaluate_direction(direction, safe_acts[n_train:], unsafe_acts[n_train:])
+            ev = evaluate_direction(
+                direction, safe_acts[safe_val_idx], unsafe_acts[eval_idx]
+            )
             mlflow.log_metric("refusal_direction_auroc", ev["auroc"])
-            logger.info(f"refusal direction AUROC={ev['auroc']:.4f}")
+            logger.info(f"refusal direction AUROC={ev['auroc']:.4f} "
+                        f"(fit on U_select, eval on U_eval)")
         except Exception:
             log_exception(logger, "refusal direction failed")
             ev = None

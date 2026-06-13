@@ -12,7 +12,8 @@ logger = get_logger("eval")
 
 
 def _encode_prompt_to_pc_vector(extractor, sae, prompt, layer_idx, feature_index_map):
-    act = extractor.get_last_token_activation(prompt, layer_idx)
+    formatted = format_prompt(prompt, extractor.tokenizer)
+    act = extractor.get_last_token_activation(formatted, layer_idx)
     z_dense = sae.encode_np(act)
     if z_dense.ndim == 1:
         z_dense = z_dense[None, :]
@@ -25,56 +26,12 @@ def _encode_prompt_to_pc_vector(extractor, sae, prompt, layer_idx, feature_index
 def evaluate_attack_success(extractor, prompts, monitor=None, max_new_tokens=128, judge_fn=None):
     if judge_fn is None:
         judge_fn = is_refusal
-    n_attacks = 0
     n_blocked = 0
-    n_refused = 0
+    n_gen_refused = 0
+    n_gen_complied = 0
     records = []
     for p in tqdm(prompts, desc="ASR", leave=False):
         try:
-            formatted = format_prompt(p, extractor.tokenizer)
-            blocked = False
-            if monitor is not None:
-                z = _encode_prompt_to_pc_vector(
-                    extractor, monitor.sae, p, monitor.layer_idx, monitor.feature_index_map
-                )
-                pred = monitor.predict(z)
-                blocked = bool(pred["is_unsafe"][0]) if pred["is_unsafe"] is not None else False
-                if blocked:
-                    n_blocked += 1
-            if not blocked:
-                out = extractor.generate(formatted, max_new_tokens=max_new_tokens)
-                refused = judge_fn(out)
-                if refused:
-                    n_refused += 1
-                else:
-                    n_attacks += 1
-                records.append({"prompt": p, "blocked": False, "response": out, "refused": refused})
-            else:
-                records.append({"prompt": p, "blocked": True, "response": None, "refused": True})
-        except Exception:
-            log_exception(logger, f"failed on prompt: {p[:60]!r}")
-            records.append({"prompt": p, "blocked": False, "response": None, "refused": False, "error": True})
-    N = len(prompts)
-    return {
-        "n_prompts": N,
-        "n_blocked_by_monitor": n_blocked,
-        "n_refused_by_model": n_refused,
-        "n_attacks_successful": n_attacks,
-        "attack_success_rate": n_attacks / N if N > 0 else 0.0,
-        "monitor_block_rate": n_blocked / N if N > 0 else 0.0,
-        "records": records,
-    }
-
-
-def evaluate_over_refusal(extractor, benign_prompts, monitor=None, max_new_tokens=128, judge_fn=None):
-    if judge_fn is None:
-        judge_fn = is_refusal
-    n_overrefused = 0
-    n_complied = 0
-    records = []
-    for p in tqdm(benign_prompts, desc="overR", leave=False):
-        try:
-            formatted = format_prompt(p, extractor.tokenizer)
             blocked = False
             if monitor is not None:
                 z = _encode_prompt_to_pc_vector(
@@ -83,24 +40,82 @@ def evaluate_over_refusal(extractor, benign_prompts, monitor=None, max_new_token
                 pred = monitor.predict(z)
                 blocked = bool(pred["is_unsafe"][0]) if pred["is_unsafe"] is not None else False
             if blocked:
-                n_overrefused += 1
+                n_blocked += 1
                 records.append({"prompt": p, "blocked": True, "response": None, "refused": True})
+                continue
+            formatted = format_prompt(p, extractor.tokenizer)
+            out = extractor.generate(formatted, max_new_tokens=max_new_tokens)
+            refused = judge_fn(out)
+            if refused:
+                n_gen_refused += 1
             else:
-                out = extractor.generate(formatted, max_new_tokens=max_new_tokens)
-                refused = judge_fn(out)
-                if refused:
-                    n_overrefused += 1
-                else:
-                    n_complied += 1
-                records.append({"prompt": p, "blocked": False, "response": out, "refused": refused})
+                n_gen_complied += 1
+            records.append({"prompt": p, "blocked": False, "response": out, "refused": refused})
         except Exception:
             log_exception(logger, f"failed on prompt: {p[:60]!r}")
-            records.append({"prompt": p, "blocked": False, "response": None, "refused": False, "error": True})
+            records.append({"prompt": p, "blocked": False, "response": None,
+                            "refused": False, "error": True})
+    N = len(prompts)
+    return {
+        "n_prompts": N,
+        "n_blocked_by_monitor": n_blocked,
+        "n_refused_by_model": n_gen_refused,
+        "n_attacks_successful": n_gen_complied,
+        "attack_success_rate": n_gen_complied / N if N > 0 else 0.0,
+        "monitor_block_rate": n_blocked / N if N > 0 else 0.0,
+        "overall_refusal_rate": (n_blocked + n_gen_refused) / N if N > 0 else 0.0,
+        "breakdown": {
+            "blocked": n_blocked,
+            "generated_refused": n_gen_refused,
+            "generated_complied": n_gen_complied,
+        },
+        "records": records,
+    }
+
+
+def evaluate_over_refusal(extractor, benign_prompts, monitor=None, max_new_tokens=128, judge_fn=None):
+    if judge_fn is None:
+        judge_fn = is_refusal
+    n_blocked = 0
+    n_gen_refused = 0
+    n_complied = 0
+    records = []
+    for p in tqdm(benign_prompts, desc="overR", leave=False):
+        try:
+            blocked = False
+            if monitor is not None:
+                z = _encode_prompt_to_pc_vector(
+                    extractor, monitor.sae, p, monitor.layer_idx, monitor.feature_index_map
+                )
+                pred = monitor.predict(z)
+                blocked = bool(pred["is_unsafe"][0]) if pred["is_unsafe"] is not None else False
+            if blocked:
+                n_blocked += 1
+                records.append({"prompt": p, "blocked": True, "response": None, "refused": True})
+                continue
+            formatted = format_prompt(p, extractor.tokenizer)
+            out = extractor.generate(formatted, max_new_tokens=max_new_tokens)
+            refused = judge_fn(out)
+            if refused:
+                n_gen_refused += 1
+            else:
+                n_complied += 1
+            records.append({"prompt": p, "blocked": False, "response": out, "refused": refused})
+        except Exception:
+            log_exception(logger, f"failed on prompt: {p[:60]!r}")
+            records.append({"prompt": p, "blocked": False, "response": None,
+                            "refused": False, "error": True})
     N = len(benign_prompts)
+    n_overrefused = n_blocked + n_gen_refused
     return {
         "n_prompts": N,
         "over_refusal_rate": n_overrefused / N if N > 0 else 0.0,
         "compliance_rate": n_complied / N if N > 0 else 0.0,
+        "breakdown": {
+            "blocked": n_blocked,
+            "generated_refused": n_gen_refused,
+            "complied": n_complied,
+        },
         "records": records,
     }
 

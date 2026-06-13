@@ -1,24 +1,41 @@
+import re
 from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import snapshot_download
 
 from .utils import SAE_DIR, SAE_REPO, SAE_WIDTH, get_logger, log_exception, setup_hf_auth
 
 logger = get_logger("sae")
 
+DEFAULT_TARGET_L0 = 68
 
-def find_sae_path(layer, width=SAE_WIDTH, base=SAE_DIR):
+
+def _parse_l0(path):
+    m = re.search(r"average_l0_(\d+)", path.name)
+    return int(m.group(1)) if m else None
+
+
+def find_sae_path(layer, width=SAE_WIDTH, base=SAE_DIR, target_l0=DEFAULT_TARGET_L0):
     base = Path(base)
     candidates = list(base.glob(f"layer_{layer}/width_{width}/average_l0_*"))
     if not candidates:
         raise FileNotFoundError(
             f"no SAE checkpoint for layer {layer} width {width} under {base}"
         )
-    candidates.sort()
-    return candidates[0]
+    parsed = [(p, _parse_l0(p)) for p in candidates]
+    parsed = [(p, l0) for p, l0 in parsed if l0 is not None]
+    if not parsed:
+        candidates.sort()
+        chosen = candidates[0]
+        logger.warning(f"could not parse l0; falling back to {chosen.name}")
+        return chosen
+    parsed.sort(key=lambda t: (abs(t[1] - target_l0), t[1]))
+    chosen, l0 = parsed[0]
+    logger.info(f"layer {layer}: selected SAE {chosen.name} (l0={l0}, target={target_l0})")
+    return chosen
 
 
 def download_sae(layer, width=SAE_WIDTH):
@@ -47,11 +64,12 @@ class JumpReLUSAE(nn.Module):
         self.dtype = dtype
 
     @classmethod
-    def from_gemma_scope(cls, layer, width=SAE_WIDTH, device="cuda"):
+    def from_gemma_scope(cls, layer, width=SAE_WIDTH, device="cuda", target_l0=DEFAULT_TARGET_L0):
         try:
-            path = find_sae_path(layer, width=width)
+            path = find_sae_path(layer, width=width, target_l0=target_l0)
         except FileNotFoundError:
-            path = download_sae(layer, width=width)
+            download_sae(layer, width=width)
+            path = find_sae_path(layer, width=width, target_l0=target_l0)
         npz_files = list(path.glob("*.npz"))
         if not npz_files:
             raise FileNotFoundError(f"no .npz file in {path}")
@@ -114,14 +132,15 @@ def topk_binarize(z, k):
         z = z.detach().cpu().numpy()
     if z.ndim == 1:
         z = z[None, :]
-    out = np.zeros_like(z, dtype=np.uint8)
-    for i in range(z.shape[0]):
-        row = z[i]
-        if (row > 0).sum() == 0:
-            continue
-        n_pos = int((row > 0).sum())
-        kk = min(k, n_pos)
-        idx = np.argpartition(-row, kk - 1)[:kk]
-        idx = idx[row[idx] > 0]
-        out[i, idx] = 1
+    n, d = z.shape
+    out = np.zeros((n, d), dtype=np.uint8)
+    kk = min(k, d)
+    if kk <= 0:
+        return out
+    idx = np.argpartition(-z, kk - 1, axis=1)[:, :kk]
+    rows = np.repeat(np.arange(n), kk)
+    cols = idx.reshape(-1)
+    vals = z[rows, cols]
+    keep = vals > 0
+    out[rows[keep], cols[keep]] = 1
     return out

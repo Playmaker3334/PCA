@@ -57,7 +57,9 @@ def collect_prompts(corpus_name, n_max_cfg):
 
 def extract_for_corpus(extractor, prompts, layers, max_length=256):
     formatted = [format_prompt(p, extractor.tokenizer) for p in prompts]
-    return extractor.batch_residual_activations(formatted, layers, max_length=max_length)
+    by_layer, valid = extractor.batch_residual_activations(formatted, layers, max_length=max_length)
+    kept_prompts = [p for p, v in zip(prompts, valid) if v]
+    return by_layer, kept_prompts
 
 
 def main():
@@ -86,16 +88,16 @@ def main():
             logger.info(f"extracting {name}: {len(prompts)} prompts (label={label})")
             try:
                 with Timer(f"extract {name}", logger=logger):
-                    by_layer = extract_for_corpus(extractor, prompts, CANDIDATE_LAYERS)
+                    by_layer, kept_prompts = extract_for_corpus(extractor, prompts, CANDIDATE_LAYERS)
                 save_npz(
                     out_path,
-                    prompts=np.array(prompts, dtype=object),
-                    label=np.array([label] * len(prompts)),
+                    prompts=np.array(kept_prompts, dtype=object),
+                    label=np.array([label] * len(kept_prompts)),
                     **{f"layer_{L}": by_layer[L] for L in CANDIDATE_LAYERS},
                 )
-                all_counts[name] = len(prompts)
+                all_counts[name] = len(kept_prompts)
                 logger.info(f"saved {out_path}")
-                mlflow.log_metric(f"n_extracted_{name}", len(prompts))
+                mlflow.log_metric(f"n_extracted_{name}", len(kept_prompts))
             except Exception:
                 log_exception(logger, f"extraction failed for {name}")
 

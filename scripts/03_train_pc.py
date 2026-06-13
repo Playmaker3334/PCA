@@ -22,9 +22,9 @@ from src.utils import (
     SEED,
     Timer,
     get_logger,
-    log_exception,
     load_json,
     load_npz,
+    log_exception,
     save_json,
     set_seed,
     setup_mlflow,
@@ -45,15 +45,10 @@ def restrict_features(z, feature_indices, max_features=PC_NUM_TOP_FEATURES):
 
 
 def split_train_val_indices(n, val_frac=0.1, seed=SEED):
-    """Devuelve indices (no arrays) para que el split sea reconstruible
-    de forma identica en 04_evaluate.py y se evite leakage en density AUROC.
-    """
     rng = np.random.default_rng(seed)
     idx = rng.permutation(n)
     n_val = int(val_frac * n)
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
-    return train_idx, val_idx
+    return idx[n_val:], idx[:n_val]
 
 
 def main():
@@ -71,9 +66,16 @@ def main():
     X_safe_pc, feat_map = restrict_features(z_safe, feature_indices)
     X_unsafe_pc, _ = restrict_features(z_unsafe, feature_indices)
     logger.info(f"X_safe={X_safe_pc.shape} X_unsafe={X_unsafe_pc.shape}")
-    logger.info(f"density safe={X_safe_pc.mean():.4f} unsafe={X_unsafe_pc.mean():.4f}")
 
-    # split por indices, persistido a disco para reuso sin leakage
+    unsafe_split = load_json(METRICS / "unsafe_split.json")
+    if unsafe_split["n_unsafe"] != len(X_unsafe_pc):
+        raise RuntimeError("unsafe_split.json out of sync with saved features; "
+                           "rerun 02_localize_features")
+    select_idx = np.array(unsafe_split["select_idx"], dtype=np.int64)
+    X_unsafe_select = X_unsafe_pc[select_idx]
+    logger.info(f"unsafe split: select={X_unsafe_select.shape} "
+                f"(eval reserved for 04)")
+
     train_idx, val_idx = split_train_val_indices(len(X_safe_pc), val_frac=0.1, seed=SEED)
     train_X = X_safe_pc[train_idx]
     val_X = X_safe_pc[val_idx]
@@ -89,7 +91,7 @@ def main():
         "feature_index_map": feat_map.tolist(),
     }
     save_json(split_record, METRICS / "pc_split.json")
-    logger.info(f"saved split indices to {METRICS / 'pc_split.json'}")
+    logger.info(f"saved safe split to {METRICS / 'pc_split.json'}")
 
     with setup_mlflow("03_train_pc"):
         mlflow.log_params({
@@ -101,7 +103,7 @@ def main():
             "batch_size": PC_BATCH_SIZE,
             "n_train": len(train_X),
             "n_val": len(val_X),
-            "n_unsafe": len(X_unsafe_pc),
+            "n_unsafe_select": len(X_unsafe_select),
         })
 
         try:
@@ -122,10 +124,10 @@ def main():
 
         train_nll = float(-pc.log_prob(train_X).detach().cpu().mean())
         val_nll = float(-pc.log_prob(val_X).detach().cpu().mean())
-        unsafe_nll = float(-pc.log_prob(X_unsafe_pc).detach().cpu().mean())
+        unsafe_nll = float(-pc.log_prob(X_unsafe_select).detach().cpu().mean())
         separation = unsafe_nll - val_nll
         logger.info(f"NLL: train={train_nll:.3f} val={val_nll:.3f} "
-                    f"unsafe={unsafe_nll:.3f} sep={separation:.3f}")
+                    f"unsafe_select={unsafe_nll:.3f} sep={separation:.3f}")
         mlflow.log_metrics({
             "final_train_nll": train_nll,
             "final_val_nll": val_nll,
@@ -133,9 +135,8 @@ def main():
             "separation": separation,
         })
 
-        # calibracion sobre VAL (no visto en entrenamiento) vs unsafe
         scores_safe = -pc.log_prob(val_X).detach().cpu().numpy()
-        scores_unsafe = -pc.log_prob(X_unsafe_pc).detach().cpu().numpy()
+        scores_unsafe = -pc.log_prob(X_unsafe_select).detach().cpu().numpy()
         cal = calibrate_threshold(scores_safe, scores_unsafe)
         logger.info(f"calibration: AUROC={cal['auroc']:.4f} tau={cal['threshold']:.3f} "
                     f"tpr={cal['tpr_at_threshold']:.3f}")
@@ -147,17 +148,23 @@ def main():
 
         pc.save(PC_DIR / f"hclt_layer_{layer}")
 
+        refusal_sae = set(int(i) for i in decision.get("refusal_sae_indices", []))
+        feat_map_list = feat_map.tolist()
+        refusal_pc_features = [i for i, s in enumerate(feat_map_list) if int(s) in refusal_sae]
+        feature_descriptions = {int(k): v for k, v in decision.get("feature_descriptions", {}).items()}
+        logger.info(f"refusal features mapped into PC space: {len(refusal_pc_features)}; "
+                    f"descriptions attached: {len(feature_descriptions)}")
+
         sae = JumpReLUSAE.from_gemma_scope(layer, device=device)
-        refusal_pc_features = list(range(min(20, len(feature_indices))))
         monitor = SafetyMonitor(
             pc=pc,
             sae=sae,
             layer_idx=layer,
             refusal_features=refusal_pc_features,
-            alpha=SAFETY_ALPHA,  # inerte: el score es NLL puro (B2)
+            alpha=SAFETY_ALPHA,
             threshold=cal["threshold"],
-            feature_index_map=feat_map.tolist(),
-            feature_descriptions={},
+            feature_index_map=feat_map_list,
+            feature_descriptions=feature_descriptions,
         )
         monitor.save(PC_DIR / "monitor")
         mlflow.log_artifact(str(PC_DIR / "monitor" / "config.json"))
@@ -171,7 +178,8 @@ def main():
             "unsafe_nll": unsafe_nll,
             "separation": separation,
             "calibration": cal,
-            "score_definition": "nll_only",  # documenta la decision B2
+            "n_refusal_features": len(refusal_pc_features),
+            "score_definition": "nll_only",
         }, METRICS / "pc_training.json")
         mlflow.log_artifact(str(METRICS / "pc_training.json"))
         logger.info("training complete")

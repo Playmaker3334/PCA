@@ -27,13 +27,24 @@ class GemmaResidualExtractor:
         self.dtype = dtype
         self.num_layers = self.model.config.num_hidden_layers
         self.d_model = self.model.config.hidden_size
+        self.bos_token = getattr(self.tokenizer, "bos_token", None)
+        self.last_valid_mask = None
         logger.info(f"loaded: {self.num_layers} layers, d_model={self.d_model}")
         logger.info(f"device_map: {self.model.hf_device_map}")
+
+    def _needs_bos(self, text):
+        if self.bos_token is None:
+            return True
+        return not text.startswith(self.bos_token)
 
     @torch.no_grad()
     def encode(self, text, max_length=256):
         ids = self.tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=max_length
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=max_length,
+            add_special_tokens=self._needs_bos(text),
         ).input_ids
         return ids
 
@@ -60,21 +71,36 @@ class GemmaResidualExtractor:
         if isinstance(layer_indices, int):
             layer_indices = [layer_indices]
         results = {L: [] for L in layer_indices}
+        valid = np.zeros(len(texts), dtype=bool)
         iterator = tqdm(texts, desc="extracting", leave=False) if show_progress else texts
-        for t in iterator:
+        for i, t in enumerate(iterator):
             try:
                 acts = self.get_residual_activations(t, layer_indices, max_length=max_length)
                 for L in layer_indices:
                     results[L].append(acts[L])
-            except Exception as e:
+                valid[i] = True
+            except Exception:
                 log_exception(logger, f"failed on text: {t[:60]!r}")
-                for L in layer_indices:
-                    results[L].append(np.zeros(self.d_model, dtype=np.float32))
-        return {L: np.stack(results[L], axis=0) for L in layer_indices}
+        n_failed = int((~valid).sum())
+        if n_failed > 0:
+            logger.warning(f"dropped {n_failed}/{len(texts)} prompts (extraction failed)")
+        self.last_valid_mask = valid
+        stacked = {
+            L: (np.stack(results[L], axis=0) if results[L]
+                else np.zeros((0, self.d_model), dtype=np.float32))
+            for L in layer_indices
+        }
+        return stacked, valid
 
     @torch.no_grad()
     def generate(self, prompt, max_new_tokens=128, temperature=0.0, do_sample=False):
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+        inputs = self.tokenizer(
+            prompt,
+            return_tensors="pt",
+            truncation=True,
+            max_length=512,
+            add_special_tokens=self._needs_bos(prompt),
+        )
         inputs = {k: v.to(next(self.model.parameters()).device) for k, v in inputs.items()}
         gen_kwargs = {
             "max_new_tokens": max_new_tokens,
@@ -94,7 +120,8 @@ def format_prompt(text, tokenizer):
     try:
         return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     except Exception:
-        return f"<start_of_turn>user\n{text}<end_of_turn>\n<start_of_turn>model\n"
+        bos = getattr(tokenizer, "bos_token", "") or ""
+        return f"{bos}<start_of_turn>user\n{text}<end_of_turn>\n<start_of_turn>model\n"
 
 
 REFUSAL_MARKERS = [

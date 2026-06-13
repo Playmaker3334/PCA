@@ -1,6 +1,3 @@
-import json
-from pathlib import Path
-
 import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
@@ -30,6 +27,7 @@ def neuronpedia_keyword_search(layer, width="16k", model="gemma-2-2b",
     base = "https://www.neuronpedia.org/api/explanation/search"
     sae_id = f"{layer}-gemmascope-res-{width}"
     results = {}
+    total_hits = 0
     for kw in tqdm(keywords, desc="neuronpedia", leave=False):
         try:
             r = requests.post(
@@ -46,12 +44,15 @@ def neuronpedia_keyword_search(layer, width="16k", model="gemma-2-2b",
                     if feat_idx is not None:
                         feats.append({"index": int(feat_idx), "description": desc})
                 results[kw] = feats
+                total_hits += len(feats)
             else:
                 logger.warning(f"neuronpedia {kw}: status {r.status_code}")
                 results[kw] = []
-        except Exception as e:
+        except Exception:
             log_exception(logger, f"neuronpedia query '{kw}' failed")
             results[kw] = []
+    logger.info(f"neuronpedia layer {layer}: {total_hits} total feature hits "
+                f"(sae_id={sae_id})")
     return results
 
 
@@ -108,7 +109,7 @@ def attribution_score(activations, labels, eps=1e-8):
     return cohen_d
 
 
-def intersect_rankings(rankings, top_k=64):
+def rank_fusion(rankings, top_k=64):
     counts = {}
     weights = {}
     for ranking in rankings:
@@ -117,6 +118,9 @@ def intersect_rankings(rankings, top_k=64):
             weights[idx] = weights.get(idx, 0.0) + (len(ranking) - rank)
     order = sorted(weights.keys(), key=lambda i: (-counts[i], -weights[i]))
     return order[:top_k]
+
+
+intersect_rankings = rank_fusion
 
 
 def save_localization_report(report, layer):

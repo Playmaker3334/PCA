@@ -26,9 +26,9 @@ from src.utils import (
     SAE_FEATURES,
     Timer,
     get_logger,
-    log_exception,
     load_json,
     load_npz,
+    log_exception,
     save_json,
     set_seed,
     setup_mlflow,
@@ -63,7 +63,6 @@ def load_monitor(device="cuda"):
 
 
 def get_prompts(name, n_max):
-    """Usa los campos centralizados de dataset_fields."""
     path = RAW / name
     if not path.exists():
         logger.warning(f"missing {name}")
@@ -85,6 +84,23 @@ def get_prompts(name, n_max):
     return prompts
 
 
+def held_out_unsafe_prompts(layer):
+    unsafe_split = load_json(METRICS / "unsafe_split.json")
+    eval_idx = np.array(unsafe_split["eval_idx"], dtype=np.int64)
+    npz = load_npz(SAE_FEATURES / f"layer_{layer}_unsafe.npz")
+    if "corpus" not in npz.files:
+        raise KeyError("corpus column missing; rerun 02_localize_features")
+    prompts_all = np.array([str(p) for p in npz["prompts"]], dtype=object)
+    corpus_all = np.array([str(c) for c in npz["corpus"]])
+    mask = np.zeros(len(prompts_all), dtype=bool)
+    mask[eval_idx] = True
+    by_bench = {}
+    for bench in ["jailbreakbench", "harmbench", "advbench"]:
+        sel = np.where(mask & (corpus_all == bench))[0]
+        by_bench[bench] = [prompts_all[i] for i in sel][:MAX_PER_BENCH[bench]]
+    return by_bench
+
+
 def main():
     import mlflow
     set_seed()
@@ -93,43 +109,48 @@ def main():
     with setup_mlflow("04_evaluate"):
         monitor = load_monitor(device=device)
         extractor = GemmaResidualExtractor()
+        layer = monitor.layer_idx
         mlflow.log_params({
-            "layer": monitor.layer_idx,
+            "layer": layer,
             "threshold": monitor.threshold,
             "alpha": monitor.alpha,
         })
 
         results = {}
 
-        # --- density AUROC SIN leakage: usa val_idx persistido en 03 ---
         try:
-            layer = monitor.layer_idx
             split = load_json(METRICS / "pc_split.json")
+            unsafe_split = load_json(METRICS / "unsafe_split.json")
             val_idx = np.array(split["val_idx"], dtype=np.int64)
+            eval_idx = np.array(unsafe_split["eval_idx"], dtype=np.int64)
 
             safe_feat = load_npz(SAE_FEATURES / f"layer_{layer}_safe.npz")["z_binary"]
             unsafe_feat = load_npz(SAE_FEATURES / f"layer_{layer}_unsafe.npz")["z_binary"]
 
-            # restringe a las features del PC, igual que en 03
-            X_safe_all = safe_feat[:, monitor.feature_index_map].astype(np.float32)
-            X_unsafe = unsafe_feat[:, monitor.feature_index_map].astype(np.float32)
+            X_safe_val = safe_feat[:, monitor.feature_index_map].astype(np.float32)[val_idx]
+            X_unsafe_eval = unsafe_feat[:, monitor.feature_index_map].astype(np.float32)[eval_idx]
+            logger.info(f"density eval: n_safe_val={len(X_safe_val)} "
+                        f"n_unsafe_eval={len(X_unsafe_eval)}")
 
-            # SOLO el conjunto de validacion safe (no visto por el PC)
-            X_safe_val = X_safe_all[val_idx]
-            logger.info(f"density eval: n_safe_val={len(X_safe_val)} n_unsafe={len(X_unsafe)}")
-
-            density = evaluate_density_auroc(monitor, X_safe_val, X_unsafe)
+            density = evaluate_density_auroc(monitor, X_safe_val, X_unsafe_eval)
             results["density_auroc"] = density
             mlflow.log_metric("density_auroc", density["auroc"])
             logger.info(f"density AUROC={density['auroc']:.4f}")
         except Exception:
             log_exception(logger, "density auroc failed")
 
+        try:
+            held_out = held_out_unsafe_prompts(layer)
+        except Exception:
+            log_exception(logger, "held-out unsafe prompts unavailable; using RAW fallback")
+            held_out = {b: get_prompts(b, MAX_PER_BENCH[b])
+                        for b in ["jailbreakbench", "harmbench", "advbench"]}
+
         for bench in ["jailbreakbench", "harmbench", "advbench"]:
-            prompts = get_prompts(bench, MAX_PER_BENCH[bench])
+            prompts = held_out.get(bench, [])
             if not prompts:
                 continue
-            logger.info(f"{bench}: {len(prompts)} prompts")
+            logger.info(f"{bench}: {len(prompts)} held-out prompts")
             try:
                 with Timer(bench, logger=logger):
                     r = evaluate_attack_success(extractor, prompts, monitor=monitor)
@@ -179,7 +200,7 @@ def main():
                 log_exception(logger, "gsm8k failed")
 
         summary = {
-            "layer": monitor.layer_idx,
+            "layer": layer,
             "threshold": float(monitor.threshold),
             "alpha": float(monitor.alpha),
             "density_auroc": results.get("density_auroc", {}).get("auroc"),

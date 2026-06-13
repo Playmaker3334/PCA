@@ -1,22 +1,12 @@
 from pathlib import Path
 
 import numpy as np
-import torch
 from sklearn.metrics import roc_auc_score, roc_curve
 
 from .utils import FPR_TARGET, SAFETY_ALPHA, get_logger, save_json
 
 logger = get_logger("monitor")
 
-
-def compute_composite_score(nll, log_p_refusal=None, alpha=None):
-    """Score = NLL puro (deteccion de anomalias por densidad).
-
-    El termino de refusal se mantiene en la firma por retrocompatibilidad
-    con configs guardados, pero NO entra en el score. Las refusal_features
-    se usan solo para interpretabilidad via SafetyMonitor.explain().
-    """
-    return nll
 
 def calibrate_threshold(scores_safe, scores_unsafe, fpr_target=FPR_TARGET):
     labels = np.concatenate([np.zeros(len(scores_safe)), np.ones(len(scores_unsafe))])
@@ -26,6 +16,14 @@ def calibrate_threshold(scores_safe, scores_unsafe, fpr_target=FPR_TARGET):
     target_idx = np.searchsorted(fpr, fpr_target, side="right") - 1
     target_idx = max(0, target_idx)
     tau = float(thresholds[target_idx])
+    if not np.isfinite(tau):
+        tau = float(np.quantile(scores_safe, 1.0 - fpr_target))
+        return {
+            "threshold": tau,
+            "fpr_at_threshold": float((scores_safe > tau).mean()),
+            "tpr_at_threshold": float((scores_unsafe > tau).mean()),
+            "auroc": auroc,
+        }
     return {
         "threshold": tau,
         "fpr_at_threshold": float(fpr[target_idx]),
@@ -71,24 +69,11 @@ class SafetyMonitor:
                                   if feature_index_map is not None else None)
         self.feature_descriptions = feature_descriptions or {}
 
-
     def score(self, z_binary):
         if z_binary.ndim == 1:
             z_binary = z_binary[None, :]
         nll = -self.pc.log_prob(z_binary).detach().cpu().numpy()
-        # log_p_refusal se conserva como diagnostico, no como parte del score
-        if len(self.refusal_features) > 0:
-            obs_mask = np.zeros_like(z_binary, dtype=np.float32)
-            for f in self.refusal_features:
-                if f < z_binary.shape[1]:
-                    obs_mask[:, f] = 1.0
-            log_p_refusal = self.pc.log_prob(
-                z_binary, observed_mask=obs_mask
-            ).detach().cpu().numpy()
-        else:
-            log_p_refusal = np.zeros(z_binary.shape[0])
-        return {"nll": nll, "log_p_refusal": log_p_refusal, "score": nll}
-    
+        return {"nll": nll, "score": nll}
 
     def predict(self, z_binary):
         s = self.score(z_binary)

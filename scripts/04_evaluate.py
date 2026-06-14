@@ -40,10 +40,13 @@ MAX_PER_BENCH = {
     "jailbreakbench": 100,
     "harmbench": 100,
     "advbench": 100,
+    "inthewild": 200,
     "xstest": 100,
     "mmlu": 150,
     "gsm8k": 80,
 }
+
+ATTACK_BENCHES = ["jailbreakbench", "harmbench", "advbench", "inthewild"]
 
 
 def load_monitor(device="cuda"):
@@ -84,29 +87,27 @@ def get_prompts(name, n_max):
     return prompts
 
 
-def held_out_unsafe_prompts(layer):
+def held_out_unsafe_prompts():
     unsafe_split = load_json(METRICS / "unsafe_split.json")
-    eval_idx = np.array(unsafe_split["eval_idx"], dtype=np.int64)
+    eval_idx = set(int(i) for i in unsafe_split["eval_idx"])
+    layer = load_json(PC_DIR / "monitor" / "config.json")["layer_idx"]
     npz = load_npz(SAE_FEATURES / f"layer_{layer}_unsafe.npz")
     if "corpus" not in npz.files:
         raise KeyError("corpus column missing; rerun 02_localize_features")
     prompts_all = np.array([str(p) for p in npz["prompts"]], dtype=object)
     corpus_all = np.array([str(c) for c in npz["corpus"]])
-    mask = np.zeros(len(prompts_all), dtype=bool)
-    mask[eval_idx] = True
     by_bench = {}
-    for bench in ["jailbreakbench", "harmbench", "advbench"]:
-        sel = np.where(mask & (corpus_all == bench))[0]
+    for bench in ATTACK_BENCHES:
+        sel = [i for i in range(len(prompts_all)) if i in eval_idx and corpus_all[i] == bench]
         by_bench[bench] = [prompts_all[i] for i in sel][:MAX_PER_BENCH[bench]]
     return by_bench
 
 
 def main():
-    import mlflow
     set_seed()
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    with setup_mlflow("04_evaluate"):
+    with setup_mlflow("04_evaluate") as mlflow:
         monitor = load_monitor(device=device)
         extractor = GemmaResidualExtractor()
         layer = monitor.layer_idx
@@ -140,13 +141,12 @@ def main():
             log_exception(logger, "density auroc failed")
 
         try:
-            held_out = held_out_unsafe_prompts(layer)
+            held_out = held_out_unsafe_prompts()
         except Exception:
             log_exception(logger, "held-out unsafe prompts unavailable; using RAW fallback")
-            held_out = {b: get_prompts(b, MAX_PER_BENCH[b])
-                        for b in ["jailbreakbench", "harmbench", "advbench"]}
+            held_out = {b: get_prompts(b, MAX_PER_BENCH[b]) for b in ATTACK_BENCHES}
 
-        for bench in ["jailbreakbench", "harmbench", "advbench"]:
+        for bench in ATTACK_BENCHES:
             prompts = held_out.get(bench, [])
             if not prompts:
                 continue
@@ -207,6 +207,8 @@ def main():
             "jailbreakbench_asr": results.get("jailbreakbench", {}).get("attack_success_rate"),
             "harmbench_asr": results.get("harmbench", {}).get("attack_success_rate"),
             "advbench_asr": results.get("advbench", {}).get("attack_success_rate"),
+            "inthewild_asr": results.get("inthewild", {}).get("attack_success_rate"),
+            "inthewild_block": results.get("inthewild", {}).get("monitor_block_rate"),
             "xstest_overrefusal": results.get("xstest", {}).get("over_refusal_rate"),
             "mmlu_accuracy": results.get("mmlu", {}).get("accuracy"),
             "gsm8k_accuracy": results.get("gsm8k", {}).get("accuracy"),

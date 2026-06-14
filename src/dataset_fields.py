@@ -7,8 +7,7 @@ DATASET_FIELDS = {
     "harmbench": ["behavior", "prompt", "goal"],
     "jailbreakbench": ["Goal", "prompt", "goal", "behavior"],
     "xstest": ["prompt"],
-    "jackhhao": ["prompt", "text"],
-    "inthewild": ["prompt", "text"],
+    "inthewild": ["prompt"],
 }
 
 DATASET_LABEL = {
@@ -20,7 +19,6 @@ DATASET_LABEL = {
     "advbench": "unsafe",
     "harmbench": "unsafe",
     "jailbreakbench": "unsafe",
-    "jackhhao": "unsafe",
     "inthewild": "unsafe",
 }
 

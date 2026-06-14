@@ -1,8 +1,3 @@
-"""Mapeo centralizado dataset -> campos de texto y etiqueta.
-Fuente unica de verdad para 01_extract, 04_evaluate y 05_baselines.
-"""
-
-# Campos en orden de prioridad. El primero que exista y sea str no vacio se usa.
 DATASET_FIELDS = {
     "alpaca": ["instruction"],
     "triviaqa": ["question"],
@@ -12,6 +7,8 @@ DATASET_FIELDS = {
     "harmbench": ["behavior", "prompt", "goal"],
     "jailbreakbench": ["Goal", "prompt", "goal", "behavior"],
     "xstest": ["prompt"],
+    "jackhhao": ["prompt", "text"],
+    "inthewild": ["prompt", "text"],
 }
 
 DATASET_LABEL = {
@@ -23,6 +20,8 @@ DATASET_LABEL = {
     "advbench": "unsafe",
     "harmbench": "unsafe",
     "jailbreakbench": "unsafe",
+    "jackhhao": "unsafe",
+    "inthewild": "unsafe",
 }
 
 SAFE_CORPORA = [k for k, v in DATASET_LABEL.items() if v == "safe"]
@@ -30,11 +29,6 @@ UNSAFE_CORPORA = [k for k, v in DATASET_LABEL.items() if v == "unsafe"]
 
 
 def get_text(example, dataset_name, *, allow_fallback=False):
-    """Extrae el texto del campo correcto. Sin fallback permisivo por defecto.
-
-    Devuelve None si no encuentra un campo valido (en vez de adivinar),
-    lo que evita capturar opciones de respuesta en MMLU u otros campos.
-    """
     fields = DATASET_FIELDS.get(dataset_name, [])
     for f in fields:
         v = example.get(f)

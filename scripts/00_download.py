@@ -32,6 +32,8 @@ DATASETS = {
     "harmbench": ("walledai/HarmBench", "standard", "train"),
     "jailbreakbench": ("JailbreakBench/JBB-Behaviors", "behaviors", "harmful"),
     "xstest": ("natolambert/xstest-v2-copy", None, "gpt4"),
+    "jackhhao": ("jackhhao/jailbreak-classification", None, "train"),
+    "inthewild": ("TrustAIRLab/in-the-wild-jailbreak-prompts", "jailbreak_2023_12_25", "train"),
 }
 
 

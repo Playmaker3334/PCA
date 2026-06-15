@@ -1,3 +1,4 @@
+
 DATASET_FIELDS = {
     "alpaca": ["instruction"],
     "triviaqa": ["question"],
@@ -6,8 +7,8 @@ DATASET_FIELDS = {
     "advbench": ["prompt", "goal", "behavior"],
     "harmbench": ["behavior", "prompt", "goal"],
     "jailbreakbench": ["Goal", "prompt", "goal", "behavior"],
+    "harmful_hirundo": ["question"],
     "xstest": ["prompt"],
-    "inthewild": ["prompt"],
 }
 
 DATASET_LABEL = {
@@ -19,7 +20,7 @@ DATASET_LABEL = {
     "advbench": "unsafe",
     "harmbench": "unsafe",
     "jailbreakbench": "unsafe",
-    "inthewild": "unsafe",
+    "harmful_hirundo": "unsafe",
 }
 
 SAFE_CORPORA = [k for k, v in DATASET_LABEL.items() if v == "safe"]
@@ -27,6 +28,7 @@ UNSAFE_CORPORA = [k for k, v in DATASET_LABEL.items() if v == "unsafe"]
 
 
 def get_text(example, dataset_name, *, allow_fallback=False):
+
     fields = DATASET_FIELDS.get(dataset_name, [])
     for f in fields:
         v = example.get(f)

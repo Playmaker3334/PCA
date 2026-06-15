@@ -15,6 +15,7 @@ from src.localization import (
 )
 from src.sae import JumpReLUSAE, topk_binarize
 from src.dataset_fields import SAFE_CORPORA, UNSAFE_CORPORA
+from src.length_matching import apply_length_matching
 from src.utils import (
     ACTIVATIONS,
     CANDIDATE_LAYERS,
@@ -38,6 +39,8 @@ logger = get_logger("localize")
 SAFE = [c for c in SAFE_CORPORA if c != "xstest"]
 UNSAFE = list(UNSAFE_CORPORA)
 UNSAFE_SELECT_FRAC = 0.5
+MATCH_TOL = 15
+MATCH_K = 3
 
 
 def get_or_create_unsafe_split(n_unsafe, select_frac=UNSAFE_SELECT_FRAC, seed=SEED):
@@ -103,6 +106,17 @@ def load_activations_for_layer(layer):
             log_exception(logger, f"failed loading {name}")
     safe = np.vstack(safe_acts) if safe_acts else np.zeros((0, 1))
     unsafe = np.vstack(unsafe_acts) if unsafe_acts else np.zeros((0, 1))
+
+    if len(safe) and len(unsafe):
+        unsafe_idx_local = list(range(len(unsafe_prompts)))
+        safe, unsafe, safe_prompts, kept = apply_length_matching(
+            safe, unsafe, safe_prompts,
+            list(zip(unsafe_prompts, unsafe_corpus, unsafe_idx_local)),
+            tol=MATCH_TOL, k=MATCH_K, seed=SEED, logger=logger,
+        )
+        unsafe_prompts = [t[0] for t in kept]
+        unsafe_corpus = [t[1] for t in kept]
+
     return safe, unsafe, safe_prompts, unsafe_prompts, unsafe_corpus
 
 

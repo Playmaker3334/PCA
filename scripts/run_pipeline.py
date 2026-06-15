@@ -27,7 +27,7 @@ STAGES = [
 CRITICAL = {"00_download", "01_extract", "02_localize", "03_train_pc"}
 
 EXPECTED_DATASETS = ["alpaca", "triviaqa", "mmlu", "gsm8k",
-                     "advbench", "harmbench", "jailbreakbench", "xstest"]
+                     "jailbreakbench", "harmful_hirundo", "xstest"]
 
 
 def stage_done(stage_id, sentinel):

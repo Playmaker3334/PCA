@@ -31,8 +31,8 @@ DATASETS = {
     "advbench": ("walledai/AdvBench", None, "train"),
     "harmbench": ("walledai/HarmBench", "standard", "train"),
     "jailbreakbench": ("JailbreakBench/JBB-Behaviors", "behaviors", "harmful"),
+    "harmful_hirundo": ("hirundo-io/harmful-prompts-refusals", None, "train"),
     "xstest": ("natolambert/xstest-v2-copy", None, "gpt4"),
-    "inthewild": ("TrustAIRLab/in-the-wild-jailbreak-prompts", "jailbreak_2023_12_25", "train"),
 }
 
 

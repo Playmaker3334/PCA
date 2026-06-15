@@ -40,13 +40,13 @@ MAX_PER_BENCH = {
     "jailbreakbench": 100,
     "harmbench": 100,
     "advbench": 100,
-    "inthewild": 200,
+    "harmful_hirundo": 200,
     "xstest": 100,
     "mmlu": 150,
     "gsm8k": 80,
 }
 
-ATTACK_BENCHES = ["jailbreakbench", "harmbench", "advbench", "inthewild"]
+ATTACK_BENCHES = ["jailbreakbench", "harmbench", "advbench", "harmful_hirundo"]
 
 
 def load_monitor(device="cuda"):
@@ -207,8 +207,8 @@ def main():
             "jailbreakbench_asr": results.get("jailbreakbench", {}).get("attack_success_rate"),
             "harmbench_asr": results.get("harmbench", {}).get("attack_success_rate"),
             "advbench_asr": results.get("advbench", {}).get("attack_success_rate"),
-            "inthewild_asr": results.get("inthewild", {}).get("attack_success_rate"),
-            "inthewild_block": results.get("inthewild", {}).get("monitor_block_rate"),
+            "harmful_hirundo_asr": results.get("harmful_hirundo", {}).get("attack_success_rate"),
+            "harmful_hirundo_block": results.get("harmful_hirundo", {}).get("monitor_block_rate"),
             "xstest_overrefusal": results.get("xstest", {}).get("over_refusal_rate"),
             "mmlu_accuracy": results.get("mmlu", {}).get("accuracy"),
             "gsm8k_accuracy": results.get("gsm8k", {}).get("accuracy"),

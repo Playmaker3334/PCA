@@ -31,8 +31,8 @@ CORPUS_MAX = {
     "advbench": 520,
     "harmbench": 400,
     "jailbreakbench": 100,
+    "harmful_hirundo": 200,
     "xstest": 250,
-    "inthewild": 800,
 }
 
 

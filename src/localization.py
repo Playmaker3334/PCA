@@ -9,7 +9,7 @@ logger = get_logger("localization")
 
 
 def neuronpedia_keyword_search(layer, width="16k", model="gemma-2-2b",
-                                keywords=None, top_per_keyword=10, timeout=20):
+                                keywords=None, top_per_keyword=10, timeout=60):
     if keywords is None:
         keywords = [
             "refusal", "refuse", "deny", "decline",
@@ -21,38 +21,65 @@ def neuronpedia_keyword_search(layer, width="16k", model="gemma-2-2b",
         ]
     try:
         import requests
+        import gzip
+        import json
+        import xml.etree.ElementTree as ET
     except ImportError:
         logger.warning("requests not installed")
         return {}
-    base = "https://www.neuronpedia.org/api/explanation/search"
+
+    bucket = "https://neuronpedia-datasets.s3.us-east-1.amazonaws.com"
     sae_id = f"{layer}-gemmascope-res-{width}"
+    prefix = f"v1/{model}/{sae_id}/explanations"
+    ns = "{http://s3.amazonaws.com/doc/2006-03-01/}"
+
+    list_url = f"{bucket}/?list-type=2&prefix={prefix}/"
+    try:
+        lr = requests.get(list_url, timeout=timeout)
+        root = ET.fromstring(lr.text)
+        batch_keys = [c.find(f"{ns}Key").text
+                      for c in root.findall(f"{ns}Contents")
+                      if c.find(f"{ns}Key").text.endswith(".jsonl.gz")]
+    except Exception:
+        log_exception(logger, f"neuronpedia S3 list failed for {prefix}")
+        return {}
+
+    if not batch_keys:
+        logger.warning(f"neuronpedia: no explanation batches at {prefix}")
+        return {}
+
+    all_features = {}
+    for key in tqdm(batch_keys, desc="neuronpedia dl", leave=False):
+        try:
+            br = requests.get(f"{bucket}/{key}", timeout=timeout)
+            text = gzip.decompress(br.content).decode("utf-8")
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                idx = rec.get("index")
+                desc = rec.get("description", "")
+                if idx is not None and desc:
+                    all_features[int(idx)] = desc
+        except Exception:
+            log_exception(logger, f"neuronpedia batch {key} failed")
+
+    logger.info(f"neuronpedia layer {layer}: loaded {len(all_features)} "
+                f"feature descriptions (sae_id={sae_id})")
+
     results = {}
     total_hits = 0
-    for kw in tqdm(keywords, desc="neuronpedia", leave=False):
-        try:
-            r = requests.post(
-                base,
-                json={"modelId": model, "saeId": sae_id, "query": kw, "limit": top_per_keyword},
-                timeout=timeout,
-            )
-            if r.status_code == 200:
-                data = r.json()
-                feats = []
-                for item in data.get("results", [])[:top_per_keyword]:
-                    feat_idx = item.get("index") or item.get("feature")
-                    desc = item.get("description") or item.get("explanation", "")
-                    if feat_idx is not None:
-                        feats.append({"index": int(feat_idx), "description": desc})
-                results[kw] = feats
-                total_hits += len(feats)
-            else:
-                logger.warning(f"neuronpedia {kw}: status {r.status_code}")
-                results[kw] = []
-        except Exception:
-            log_exception(logger, f"neuronpedia query '{kw}' failed")
-            results[kw] = []
-    logger.info(f"neuronpedia layer {layer}: {total_hits} total feature hits "
-                f"(sae_id={sae_id})")
+    for kw in keywords:
+        kw_lower = kw.lower()
+        matches = [{"index": idx, "description": desc}
+                   for idx, desc in all_features.items()
+                   if kw_lower in desc.lower()]
+        matches = matches[:top_per_keyword]
+        results[kw] = matches
+        total_hits += len(matches)
+
+    logger.info(f"neuronpedia layer {layer}: {total_hits} keyword hits "
+                f"across {len(keywords)} keywords")
     return results
 
 

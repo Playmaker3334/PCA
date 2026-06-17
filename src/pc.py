@@ -64,7 +64,7 @@ def build_chow_liu_tree(mi_matrix, root=0):
 
 
 class HCLT(nn.Module):
-    def __init__(self, num_vars, num_states=PC_LATENT_STATES, parents=None, order=None, device="cuda"):
+    def __init__(self, num_vars, num_states=PC_LATENT_STATES, parents=None, order=None, device="cuda", trans_init_scale=0.1):
         super().__init__()
         self.num_vars = num_vars
         self.K = num_states
@@ -76,7 +76,7 @@ class HCLT(nn.Module):
         trans_params = {}
         for v in order:
             if parents[v] != -1:
-                trans_params[f"t_{v}"] = nn.Parameter(torch.randn(num_states, num_states) * 0.1)
+                trans_params[f"t_{v}"] = nn.Parameter(torch.randn(num_states, num_states) * trans_init_scale)
         self.logit_trans = nn.ParameterDict(trans_params)
         self.to(device)
         self._children = {v: [] for v in order}
@@ -87,7 +87,7 @@ class HCLT(nn.Module):
         self._rev_order = list(reversed(order))
 
     @classmethod
-    def from_data(cls, X, num_states=PC_LATENT_STATES, root=0, device="cuda"):
+    def from_data(cls, X, num_states=PC_LATENT_STATES, root=0, device="cuda", trans_init_scale=0.1):
         if isinstance(X, torch.Tensor):
             X = X.cpu().numpy()
         logger.info(f"computing MI matrix for {X.shape[1]} vars over {X.shape[0]} samples")
@@ -95,7 +95,7 @@ class HCLT(nn.Module):
         parents, order = build_chow_liu_tree(mi, root=root)
         logger.info(f"tree built: {len(parents)} nodes, root={root}")
         return cls(num_vars=X.shape[1], num_states=num_states,
-                   parents=parents, order=order, device=device)
+                   parents=parents, order=order, device=device, trans_init_scale=trans_init_scale)
 
     def _log_prob_impl(self, X, observed_mask=None):
         B, D = X.shape

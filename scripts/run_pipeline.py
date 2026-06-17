@@ -22,6 +22,8 @@ STAGES = [
     ("04_evaluate",   "04_evaluate.py",            METRICS / "evaluation_summary.json"),
     ("05_baselines",  "05_run_baselines.py",       METRICS / "baselines.json"),
     ("07_density",    "07_density_baselines.py",   METRICS / "density_baselines.json"),
+    ("06_qualitative","06_qualitative.py",         METRICS / "qualitative_analysis.json"),
+    ("08_dependency", "08_dependency_analysis.py", METRICS / "dependency_analysis_summary.json"),
 ]
 
 CRITICAL = {"00_download", "01_extract", "02_localize", "03_train_pc"}

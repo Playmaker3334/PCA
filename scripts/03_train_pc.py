@@ -6,17 +6,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import numpy as np
 import torch
 
+from src.dependency_analysis import select_real_features, transition_entropy, detection_metrics
 from src.monitor import SafetyMonitor, calibrate_threshold
 from src.pc import HCLT
 from src.sae import JumpReLUSAE
 from src.utils import (
     METRICS,
     PC_BATCH_SIZE,
+    PC_COLLAPSE_ENTROPY_THRESHOLD,
     PC_DIR,
     PC_LATENT_STATES,
     PC_LR,
     PC_NUM_EPOCHS,
-    PC_NUM_TOP_FEATURES,
+    PC_REAL_FEATURE_PROBE_THRESHOLD,
+    PC_TRANS_INIT_SCALE,
     SAE_FEATURES,
     SAFETY_ALPHA,
     SEED,
@@ -39,11 +42,6 @@ def load_features(layer):
     return safe["z_binary"], unsafe["z_binary"]
 
 
-def restrict_features(z, feature_indices, max_features=PC_NUM_TOP_FEATURES):
-    selected = np.array(feature_indices[:max_features], dtype=np.int64)
-    return z[:, selected].astype(np.float32), selected
-
-
 def split_train_val_indices(n, val_frac=0.1, seed=SEED):
     rng = np.random.default_rng(seed)
     idx = rng.permutation(n)
@@ -59,101 +57,114 @@ def main():
 
     decision = load_json(METRICS / "localization_decision.json")
     layer = decision["best_layer"]
-    feature_indices = decision["selected_feature_indices"]
-    logger.info(f"layer={layer} n_features={len(feature_indices)}")
+    selected = decision["selected_feature_indices"]
+    report = load_json(METRICS / f"localization_layer_{layer}.json")
+
+    positions, feat_map_clean = select_real_features(
+        selected, report["probe_top"], report["contrastive_top"],
+        PC_REAL_FEATURE_PROBE_THRESHOLD,
+    )
+    logger.info(f"layer={layer} selected={len(selected)} "
+                f"real_features(no padding)={len(feat_map_clean)}")
 
     z_safe, z_unsafe = load_features(layer)
-    X_safe_pc, feat_map = restrict_features(z_safe, feature_indices)
-    X_unsafe_pc, _ = restrict_features(z_unsafe, feature_indices)
-    logger.info(f"X_safe={X_safe_pc.shape} X_unsafe={X_unsafe_pc.shape}")
+    X_safe = z_safe[:, feat_map_clean].astype(np.float32)
+    X_unsafe = z_unsafe[:, feat_map_clean].astype(np.float32)
+    logger.info(f"X_safe={X_safe.shape} X_unsafe={X_unsafe.shape}")
 
     unsafe_split = load_json(METRICS / "unsafe_split.json")
-    if unsafe_split["n_unsafe"] != len(X_unsafe_pc):
+    if unsafe_split["n_unsafe"] != len(X_unsafe):
         raise RuntimeError("unsafe_split.json out of sync with saved features; "
                            "rerun 02_localize_features")
     select_idx = np.array(unsafe_split["select_idx"], dtype=np.int64)
-    X_unsafe_select = X_unsafe_pc[select_idx]
-    logger.info(f"unsafe split: select={X_unsafe_select.shape} "
-                f"(eval reserved for 04)")
+    eval_idx = np.array(unsafe_split["eval_idx"], dtype=np.int64)
+    X_unsafe_select = X_unsafe[select_idx]
+    X_unsafe_eval = X_unsafe[eval_idx]
 
-    train_idx, val_idx = split_train_val_indices(len(X_safe_pc), val_frac=0.1, seed=SEED)
-    train_X = X_safe_pc[train_idx]
-    val_X = X_safe_pc[val_idx]
-    logger.info(f"train={train_X.shape} val={val_X.shape}")
+    train_idx, val_idx = split_train_val_indices(len(X_safe), val_frac=0.1, seed=SEED)
+    X_safe_train = X_safe[train_idx]
+    X_safe_val = X_safe[val_idx]
+
+    X_train_combined = np.vstack([X_safe_train, X_unsafe_select])
+    rng = np.random.default_rng(SEED)
+    perm = rng.permutation(len(X_train_combined))
+    n_inner_val = max(1, int(0.15 * len(X_train_combined)))
+    inner_val = X_train_combined[perm[:n_inner_val]]
+    inner_train = X_train_combined[perm[n_inner_val:]]
+    logger.info(f"combined training: total={len(X_train_combined)} "
+                f"(safe_train={len(X_safe_train)} + unsafe_select={len(X_unsafe_select)}) "
+                f"inner_train={len(inner_train)} inner_val={len(inner_val)}")
 
     split_record = {
         "layer": int(layer),
         "seed": int(SEED),
         "val_frac": 0.1,
-        "n_safe_total": int(len(X_safe_pc)),
+        "n_safe_total": int(len(X_safe)),
         "train_idx": train_idx.tolist(),
         "val_idx": val_idx.tolist(),
-        "feature_index_map": feat_map.tolist(),
+        "feature_index_map": [int(x) for x in feat_map_clean],
+        "padding_dropped": True,
+        "n_features_after_padding_drop": int(len(feat_map_clean)),
+        "training_distribution": "combined_safe_train_plus_unsafe_select",
     }
     save_json(split_record, METRICS / "pc_split.json")
-    logger.info(f"saved safe split to {METRICS / 'pc_split.json'}")
 
     with setup_mlflow("03_train_pc"):
         mlflow.log_params({
             "layer": layer,
-            "n_features": len(feature_indices),
+            "n_features": len(feat_map_clean),
             "K_latent_states": PC_LATENT_STATES,
             "epochs": PC_NUM_EPOCHS,
             "lr": PC_LR,
+            "trans_init_scale": PC_TRANS_INIT_SCALE,
             "batch_size": PC_BATCH_SIZE,
-            "n_train": len(train_X),
-            "n_val": len(val_X),
-            "n_unsafe_select": len(X_unsafe_select),
+            "training_distribution": "combined",
         })
 
         try:
             with Timer("HCLT structure", logger=logger):
-                pc = HCLT.from_data(train_X, num_states=PC_LATENT_STATES, root=0, device=device)
+                pc = HCLT.from_data(inner_train, num_states=PC_LATENT_STATES, root=0,
+                                    device=device, trans_init_scale=PC_TRANS_INIT_SCALE)
             with Timer("HCLT training", logger=logger):
                 history = pc.fit(
-                    train_X,
+                    inner_train,
                     num_epochs=PC_NUM_EPOCHS,
                     batch_size=PC_BATCH_SIZE,
                     lr=PC_LR,
-                    val_X=val_X,
+                    val_X=inner_val,
                     mlflow_log=True,
                 )
         except Exception:
             log_exception(logger, "PC training failed")
             raise
 
-        train_nll = float(-pc.log_prob(train_X).detach().cpu().mean())
-        val_nll = float(-pc.log_prob(val_X).detach().cpu().mean())
-        unsafe_nll = float(-pc.log_prob(X_unsafe_select).detach().cpu().mean())
-        separation = unsafe_nll - val_nll
-        logger.info(f"NLL: train={train_nll:.3f} val={val_nll:.3f} "
-                    f"unsafe_select={unsafe_nll:.3f} sep={separation:.3f}")
-        mlflow.log_metrics({
-            "final_train_nll": train_nll,
-            "final_val_nll": val_nll,
-            "final_unsafe_nll": unsafe_nll,
-            "separation": separation,
-        })
+        collapse = transition_entropy(pc, collapse_threshold=PC_COLLAPSE_ENTROPY_THRESHOLD)
+        logger.info(f"transition entropy mean={collapse['mean']:.4f} "
+                    f"near_uniform={collapse['n_near_uniform']}/{collapse['n_transitions']} "
+                    f"collapsed={collapse['collapsed']}")
+        if collapse["collapsed"]:
+            logger.warning("PC COLLAPSED: transitions near-uniform, conditional dependencies "
+                           "not modeled. Increase PC_TRANS_INIT_SCALE, lower PC_LATENT_STATES, "
+                           "or raise PC_NUM_EPOCHS.")
+        mlflow.log_metric("transition_entropy_mean", collapse["mean"])
+        mlflow.log_metric("transition_n_near_uniform", collapse["n_near_uniform"])
 
-        scores_safe = -pc.log_prob(val_X).detach().cpu().numpy()
+        det = detection_metrics(pc, X_safe_val, X_unsafe_eval)
+        logger.info(f"held-out detection AUROC={det['auroc']:.4f} "
+                    f"nll safe={det['nll_safe_mean']:.2f} unsafe={det['nll_unsafe_mean']:.2f}")
+        mlflow.log_metric("heldout_detection_auroc", det["auroc"])
+
+        scores_safe = -pc.log_prob(X_safe_val).detach().cpu().numpy()
         scores_unsafe = -pc.log_prob(X_unsafe_select).detach().cpu().numpy()
         cal = calibrate_threshold(scores_safe, scores_unsafe)
-        logger.info(f"calibration: AUROC={cal['auroc']:.4f} tau={cal['threshold']:.3f} "
-                    f"tpr={cal['tpr_at_threshold']:.3f}")
-        mlflow.log_metrics({
-            "calibration_auroc": cal["auroc"],
-            "threshold": cal["threshold"],
-            "tpr_at_threshold": cal["tpr_at_threshold"],
-        })
+        logger.info(f"calibration: tau={cal['threshold']:.3f} tpr={cal['tpr_at_threshold']:.3f}")
+        mlflow.log_metric("threshold", cal["threshold"])
 
         pc.save(PC_DIR / f"hclt_layer_{layer}")
 
         refusal_sae = set(int(i) for i in decision.get("refusal_sae_indices", []))
-        feat_map_list = feat_map.tolist()
-        refusal_pc_features = [i for i, s in enumerate(feat_map_list) if int(s) in refusal_sae]
+        refusal_pc_features = [i for i, s in enumerate(feat_map_clean) if int(s) in refusal_sae]
         feature_descriptions = {int(k): v for k, v in decision.get("feature_descriptions", {}).items()}
-        logger.info(f"refusal features mapped into PC space: {len(refusal_pc_features)}; "
-                    f"descriptions attached: {len(feature_descriptions)}")
 
         sae = JumpReLUSAE.from_gemma_scope(layer, device=device)
         monitor = SafetyMonitor(
@@ -163,7 +174,7 @@ def main():
             refusal_features=refusal_pc_features,
             alpha=SAFETY_ALPHA,
             threshold=cal["threshold"],
-            feature_index_map=feat_map_list,
+            feature_index_map=[int(x) for x in feat_map_clean],
             feature_descriptions=feature_descriptions,
         )
         monitor.save(PC_DIR / "monitor")
@@ -171,15 +182,28 @@ def main():
 
         save_json({
             "layer": layer,
-            "n_features": len(feature_indices),
+            "n_features": len(feat_map_clean),
+            "feature_index_map": [int(x) for x in feat_map_clean],
+            "hyperparameters": {
+                "K_latent_states": PC_LATENT_STATES,
+                "epochs": PC_NUM_EPOCHS,
+                "lr": PC_LR,
+                "trans_init_scale": PC_TRANS_INIT_SCALE,
+                "batch_size": PC_BATCH_SIZE,
+                "padding_dropped": True,
+                "training_distribution": "combined_safe_plus_unsafe_select",
+            },
             "history": history,
-            "train_nll": train_nll,
-            "val_nll": val_nll,
-            "unsafe_nll": unsafe_nll,
-            "separation": separation,
+            "collapse_diagnostic": collapse,
+            "heldout_detection": det,
             "calibration": cal,
             "n_refusal_features": len(refusal_pc_features),
-            "score_definition": "nll_only",
+            "rationale": (
+                "Trained on the combined corpus because the dependency structure among "
+                "safety concepts is only estimable from data that contains unsafe examples. "
+                "Anti-collapse hyperparameters (strong transition init, smaller K, more epochs, "
+                "padding dropped) prevent the circuit from degenerating to independent marginals."
+            ),
         }, METRICS / "pc_training.json")
         mlflow.log_artifact(str(METRICS / "pc_training.json"))
         logger.info("training complete")

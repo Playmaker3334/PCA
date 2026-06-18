@@ -56,6 +56,11 @@ def expected_calibration_error(scores, labels, n_bins=10):
 
 
 class SafetyMonitor:
+    # alpha is VESTIGIAL: kept only to document that an earlier composite score
+    # (alpha * NLL + (1 - alpha) * refusal-feature term) was deliberately removed
+    # because it mixed incomparable scales. The anomaly score is NLL ONLY; alpha and
+    # refusal_features never enter score()/predict() and are retained for provenance
+    # and for interpretability via explain().
     def __init__(self, pc, sae, layer_idx, refusal_features=None,
                  alpha=SAFETY_ALPHA, threshold=None,
                  feature_index_map=None, feature_descriptions=None):
@@ -110,8 +115,11 @@ class SafetyMonitor:
         self.pc.save(path / "pc")
         config = {
             "layer_idx": int(self.layer_idx),
-            "refusal_features": [int(f) for f in self.refusal_features],
+            "score": "nll_only",
             "alpha": float(self.alpha),
+            "alpha_used_in_decision": False,
+            "refusal_features": [int(f) for f in self.refusal_features],
+            "refusal_features_used_in_decision": False,
             "threshold": float(self.threshold) if self.threshold is not None else None,
             "feature_index_map": ([int(x) for x in self.feature_index_map]
                                    if self.feature_index_map is not None else None),

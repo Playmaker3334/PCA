@@ -70,6 +70,35 @@ def split_safe(n_safe, val_frac=0.1, seed=SEED):
     return idx[n_val:], idx[:n_val]
 
 
+def load_aligned_splits(n_unsafe, n_safe):
+    us_path = METRICS / "unsafe_split.json"
+    ss_path = METRICS / "safe_split.json"
+    if us_path.exists() and ss_path.exists():
+        us = load_json(us_path)
+        ss = load_json(ss_path)
+        if us.get("n_unsafe") == n_unsafe and ss.get("n_safe") == n_safe:
+            logger.info("using persisted splits (aligned with PC monitor): "
+                        "refusal direction is apples-to-apples")
+            return (np.array(us["select_idx"], dtype=np.int64),
+                    np.array(us["eval_idx"], dtype=np.int64),
+                    np.array(ss["train_idx"], dtype=np.int64),
+                    np.array(ss["val_idx"], dtype=np.int64),
+                    True)
+        logger.warning(f"persisted split count mismatch "
+                       f"(unsafe {us.get('n_unsafe')} vs {n_unsafe}, "
+                       f"safe {ss.get('n_safe')} vs {n_safe}); local recompute, "
+                       f"comparison NOT apples-to-apples (rerun 02 to align)")
+    else:
+        logger.warning("persisted splits not found; local recompute, "
+                       "comparison NOT apples-to-apples (rerun 02 to align)")
+    rng = np.random.default_rng(SEED)
+    perm = rng.permutation(n_unsafe)
+    n_sel = int(0.5 * n_unsafe)
+    select_idx, eval_idx = perm[:n_sel], perm[n_sel:]
+    safe_train_idx, safe_val_idx = split_safe(n_safe, seed=SEED)
+    return select_idx, eval_idx, safe_train_idx, safe_val_idx, False
+
+
 def evaluate_direction(direction, X_safe, X_unsafe):
     s_safe = baseline_score_with_direction(X_safe, direction)
     s_unsafe = baseline_score_with_direction(X_unsafe, direction)
@@ -139,14 +168,8 @@ def main():
         logger.info(f"safe={safe_acts.shape} unsafe={unsafe_acts.shape}")
 
         try:
-            n_unsafe = len(unsafe_acts)
-            rng = np.random.default_rng(SEED)
-            perm = rng.permutation(n_unsafe)
-            n_sel = int(0.5 * n_unsafe)
-            select_idx = perm[:n_sel]
-            eval_idx = perm[n_sel:]
-
-            safe_train_idx, safe_val_idx = split_safe(len(safe_acts), seed=SEED)
+            select_idx, eval_idx, safe_train_idx, safe_val_idx, comparable = \
+                load_aligned_splits(len(unsafe_acts), len(safe_acts))
 
             direction = baseline_refusal_direction(
                 unsafe_acts[select_idx], safe_acts[safe_train_idx]
@@ -154,9 +177,12 @@ def main():
             ev = evaluate_direction(
                 direction, safe_acts[safe_val_idx], unsafe_acts[eval_idx]
             )
+            ev["comparable_to_monitor"] = bool(comparable)
             mlflow.log_metric("refusal_direction_auroc", ev["auroc"])
+            mlflow.log_param("refusal_direction_comparable", comparable)
             logger.info(f"refusal direction AUROC={ev['auroc']:.4f} "
-                        f"(matched corpus, fit on U_select, eval on U_eval)")
+                        f"(fit on U_select+S_train, eval on U_eval+S_val, "
+                        f"comparable={comparable})")
         except Exception:
             log_exception(logger, "refusal direction failed")
             ev = None

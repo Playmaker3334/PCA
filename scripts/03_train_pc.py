@@ -42,13 +42,6 @@ def load_features(layer):
     return safe["z_binary"], unsafe["z_binary"]
 
 
-def split_train_val_indices(n, val_frac=0.1, seed=SEED):
-    rng = np.random.default_rng(seed)
-    idx = rng.permutation(n)
-    n_val = int(val_frac * n)
-    return idx[n_val:], idx[:n_val]
-
-
 def main():
     import mlflow
     set_seed()
@@ -81,9 +74,21 @@ def main():
     X_unsafe_select = X_unsafe[select_idx]
     X_unsafe_eval = X_unsafe[eval_idx]
 
-    train_idx, val_idx = split_train_val_indices(len(X_safe), val_frac=0.1, seed=SEED)
+    safe_split_path = METRICS / "safe_split.json"
+    if not safe_split_path.exists():
+        raise RuntimeError("safe_split.json missing; rerun 02_localize_features. "
+                           "The safe split must be created at localization time so that "
+                           "feature selection never sees safe_val (no negative-side leak).")
+    safe_split = load_json(safe_split_path)
+    if safe_split["n_safe"] != len(X_safe):
+        raise RuntimeError("safe_split.json out of sync with saved features; "
+                           "rerun 02_localize_features")
+    train_idx = np.array(safe_split["train_idx"], dtype=np.int64)
+    val_idx = np.array(safe_split["val_idx"], dtype=np.int64)
     X_safe_train = X_safe[train_idx]
     X_safe_val = X_safe[val_idx]
+    logger.info(f"safe split loaded from safe_split.json: "
+                f"train={len(train_idx)} val={len(val_idx)}")
 
     X_train_combined = np.vstack([X_safe_train, X_unsafe_select])
     rng = np.random.default_rng(SEED)
@@ -98,7 +103,7 @@ def main():
     split_record = {
         "layer": int(layer),
         "seed": int(SEED),
-        "val_frac": 0.1,
+        "val_frac": float(safe_split.get("val_frac", 0.1)),
         "n_safe_total": int(len(X_safe)),
         "train_idx": train_idx.tolist(),
         "val_idx": val_idx.tolist(),
@@ -106,6 +111,7 @@ def main():
         "padding_dropped": True,
         "n_features_after_padding_drop": int(len(feat_map_clean)),
         "training_distribution": "combined_safe_train_plus_unsafe_select",
+        "safe_split_source": "safe_split.json",
     }
     save_json(split_record, METRICS / "pc_split.json")
 

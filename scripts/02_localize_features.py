@@ -39,6 +39,7 @@ logger = get_logger("localize")
 SAFE = [c for c in SAFE_CORPORA if c != "xstest"]
 UNSAFE = list(UNSAFE_CORPORA)
 UNSAFE_SELECT_FRAC = 0.5
+SAFE_VAL_FRAC = 0.1
 MATCH_TOL = 15
 MATCH_K = 3
 
@@ -65,6 +66,30 @@ def get_or_create_unsafe_split(n_unsafe, select_frac=UNSAFE_SELECT_FRAC, seed=SE
     logger.info(f"created unsafe split: n={n_unsafe} "
                 f"select={len(select_idx)} eval={len(eval_idx)}")
     return select_idx, eval_idx
+
+
+def get_or_create_safe_split(n_safe, val_frac=SAFE_VAL_FRAC, seed=SEED):
+    path = METRICS / "safe_split.json"
+    if path.exists():
+        rec = load_json(path)
+        if rec.get("n_safe") == n_safe:
+            return (np.array(rec["train_idx"], dtype=np.int64),
+                    np.array(rec["val_idx"], dtype=np.int64))
+        logger.warning("safe split count mismatch; recreating")
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(n_safe)
+    n_val = int(val_frac * n_safe)
+    val_idx, train_idx = perm[:n_val], perm[n_val:]
+    save_json({
+        "n_safe": int(n_safe),
+        "val_frac": float(val_frac),
+        "seed": int(seed),
+        "train_idx": train_idx.tolist(),
+        "val_idx": val_idx.tolist(),
+    }, path)
+    logger.info(f"created safe split: n={n_safe} "
+                f"train={len(train_idx)} val={len(val_idx)}")
+    return train_idx, val_idx
 
 
 def build_feature_descriptions(np_results):
@@ -159,21 +184,22 @@ def localize_layer(layer):
              corpus=np.array(unsafe_c, dtype=object))
 
     select_idx, _eval_idx = get_or_create_unsafe_split(len(z_unsafe_bin))
+    safe_train_idx, _safe_val_idx = get_or_create_safe_split(len(z_safe_bin))
     z_unsafe_sel = z_unsafe_bin[select_idx].astype(np.float32)
-    z_safe_f = z_safe_bin.astype(np.float32)
-    logger.info(f"localization on U_select: safe={z_safe_f.shape} "
-                f"unsafe_select={z_unsafe_sel.shape}")
+    z_safe_train = z_safe_bin[safe_train_idx].astype(np.float32)
+    logger.info(f"localization on U_select vs S_train (no val leak): "
+                f"safe_train={z_safe_train.shape} unsafe_select={z_unsafe_sel.shape}")
 
     logger.info("running linear probe")
-    probe = linear_probe(z_unsafe_sel, z_safe_f)
+    probe = linear_probe(z_unsafe_sel, z_safe_train)
     logger.info(f"probe AUROC={probe['auroc']:.4f} nonzero={probe['nonzero_coefs']}")
 
     logger.info("running contrastive difference")
-    diff = contrastive_difference(z_unsafe_sel, z_safe_f)
+    diff = contrastive_difference(z_unsafe_sel, z_safe_train)
 
     logger.info("running attribution")
-    labels = np.concatenate([np.ones(len(z_unsafe_sel)), np.zeros(len(z_safe_f))])
-    X_all = np.vstack([z_unsafe_sel, z_safe_f]).astype(np.float32)
+    labels = np.concatenate([np.ones(len(z_unsafe_sel)), np.zeros(len(z_safe_train))])
+    X_all = np.vstack([z_unsafe_sel, z_safe_train]).astype(np.float32)
     attribution = attribution_score(X_all, labels)
     top_attribution = [(int(i), float(attribution[i]))
                        for i in np.argsort(-np.abs(attribution))[:50]]
@@ -198,7 +224,8 @@ def localize_layer(layer):
         "attribution_top": top_attribution,
         "intersected_top_features": intersect,
         "neuronpedia": np_results,
-        "n_safe": int(len(z_safe_f)),
+        "n_safe": int(len(z_safe_train)),
+        "n_safe_total": int(len(z_safe_bin)),
         "n_unsafe_select": int(len(z_unsafe_sel)),
     }
     save_localization_report(report, layer)
@@ -242,6 +269,7 @@ def main():
             "selected_feature_indices": list(map(int, selected)),
             "feature_descriptions": feature_descriptions,
             "refusal_sae_indices": refusal_sae_indices,
+            "safe_selection_no_val_leak": True,
             "reconstruction_error": {
                 "safe": float(best["reconstruction_error_safe"]),
                 "unsafe": float(best["reconstruction_error_unsafe"]),

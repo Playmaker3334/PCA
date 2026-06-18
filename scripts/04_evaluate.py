@@ -120,17 +120,24 @@ def main():
         results = {}
 
         try:
-            split = load_json(METRICS / "pc_split.json")
+            safe_split = load_json(METRICS / "safe_split.json")
             unsafe_split = load_json(METRICS / "unsafe_split.json")
-            val_idx = np.array(split["val_idx"], dtype=np.int64)
+            val_idx = np.array(safe_split["val_idx"], dtype=np.int64)
             eval_idx = np.array(unsafe_split["eval_idx"], dtype=np.int64)
 
             safe_feat = load_npz(SAE_FEATURES / f"layer_{layer}_safe.npz")["z_binary"]
             unsafe_feat = load_npz(SAE_FEATURES / f"layer_{layer}_unsafe.npz")["z_binary"]
 
+            if safe_split["n_safe"] != len(safe_feat):
+                raise RuntimeError("safe_split.json out of sync with saved safe features; "
+                                   "rerun 02_localize_features and 03_train_pc")
+            if unsafe_split["n_unsafe"] != len(unsafe_feat):
+                raise RuntimeError("unsafe_split.json out of sync with saved unsafe features; "
+                                   "rerun 02_localize_features")
+
             X_safe_val = safe_feat[:, monitor.feature_index_map].astype(np.float32)[val_idx]
             X_unsafe_eval = unsafe_feat[:, monitor.feature_index_map].astype(np.float32)[eval_idx]
-            logger.info(f"density eval: n_safe_val={len(X_safe_val)} "
+            logger.info(f"density eval (held-out S_val vs U_eval): n_safe_val={len(X_safe_val)} "
                         f"n_unsafe_eval={len(X_unsafe_eval)}")
 
             density = evaluate_density_auroc(monitor, X_safe_val, X_unsafe_eval)

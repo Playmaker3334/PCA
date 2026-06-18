@@ -422,7 +422,7 @@ def _short_label(sae_idx, descriptions):
     return f"f{sae_idx}"
 
 
-def generate_figures(tree, descriptions, safety_set, out_dir):
+def generate_figures(tree, descriptions, safety_set, out_dir, layer=None):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -432,6 +432,8 @@ def generate_figures(tree, descriptions, safety_set, out_dir):
     except ImportError:
         logger.warning("matplotlib/networkx not available, skipping figures")
         return []
+
+    model_tag = f"Gemma-2-2B layer {layer}" if layer is not None else "Gemma-2-2B"
 
     edge_lift = {}
     G_full = nx.DiGraph()
@@ -498,8 +500,8 @@ def generate_figures(tree, descriptions, safety_set, out_dir):
         saved.append(str(path))
 
     draw(G_full, out_dir / "concept_hierarchy.png",
-         "Learned dependency hierarchy over SAE concepts (Gemma-2-2B layer 17)\n"
-         "edge width proportional to conditional lift")
+         f"Dependency structure over SAE concepts ({model_tag})\n"
+         "undirected Chow-Liu tree shown rooted by convention; edge width proportional to conditional lift")
 
     keep = set(safety_set)
     for s in list(safety_set):
@@ -508,7 +510,7 @@ def generate_figures(tree, descriptions, safety_set, out_dir):
             keep.update(G_full.successors(s))
     G_pruned = G_full.subgraph(keep).copy()
     draw(G_pruned, out_dir / "concept_hierarchy_pruned.png",
-         "Safety-concept dependency subgraph (Gemma-2-2B layer 17)\n"
-         "pruned to safety concepts and direct neighbors, edge width proportional to conditional lift")
+         f"Safety-concept dependency subgraph ({model_tag})\n"
+         "pruned to safety concepts and direct neighbors; edge width proportional to conditional lift")
 
     return saved
